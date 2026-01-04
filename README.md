@@ -1,7 +1,7 @@
 # AviUtl2-MyAssetManager
 
 AviUtl2用 アセット（素材）管理プラグイン
-作成者: [なたでここ/Natadecoco_2539]
+作成者: [なたのこ/Natadecoco_2539]
 
 ■ 概要
 AviUtl2で画像や動画素材、オブジェクトの構成を便利に管理・再利用するためのプラグインです。
