@@ -1,6 +1,6 @@
 // ------------------------------------------------------------
 // MyAssetManager.cpp
-// v1.2 
+// v1.3
 // ------------------------------------------------------------
 
 #define NOMINMAX
@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <sstream>
 #include <set>
+#include <fstream>
+#include <functional>
 
 // GDI+ Headers
 #include <objidl.h>
@@ -41,6 +43,7 @@ using namespace Gdiplus;
 #define WM_REFRESH_ASSETS       (WM_USER + 100)
 #define ID_TIMER_HOVER          998
 #define ID_TIMER_ADD_PREVIEW    997 
+#define ID_TIMER_TOOLTIP        996 
 
 #define ID_COMBO_CATEGORY 200
 #define ID_BTN_FAV_SORT   201
@@ -87,14 +90,26 @@ static constexpr COLORREF COL_BTN_BG    = RGB(60, 60, 60);
 static constexpr COLORREF COL_BTN_PUSH  = RGB(100, 100, 100);
 static constexpr COLORREF COL_BTN_ACT   = RGB(100, 120, 200);
 static constexpr COLORREF COL_INPUT_BG  = RGB(20, 20, 20);
-static constexpr COLORREF COL_FIXED_MARK = RGB(31, 205, 219);
+static constexpr COLORREF COL_FIXED_TEXT = RGB(31, 205, 219); 
+
+static constexpr COLORREF COL_TIP_BG     = RGB(50, 50, 50);
+static constexpr COLORREF COL_TIP_BORDER = RGB(100, 100, 100);
+static constexpr COLORREF COL_TIP_TEXT   = RGB(230, 230, 230);
 
 // --- 構造体 ---
 struct Asset {
-    std::wstring name; std::wstring path; std::wstring imagePath; std::wstring category;
+    std::wstring name; 
+    std::wstring path; 
+    std::wstring imagePath; 
+    std::wstring category;
     bool isFavorite; 
     bool isFixedFrame; 
-    Image* pImage; UINT frameCount; UINT* frameDelays; int currentFrame; PropertyItem* pPropertyItem;
+    bool isMulti;      
+    Image* pImage; 
+    UINT frameCount; 
+    UINT* frameDelays; 
+    int currentFrame; 
+    PropertyItem* pPropertyItem;
 };
 
 struct EDIT_SECTION_SAFE {
@@ -131,9 +146,11 @@ static HWND g_hSnipWnd = nullptr;
 static HWND g_hInfoWnd = nullptr;
 static HWND g_hCombo = nullptr;
 static HWND g_hSearch = nullptr;
+static HWND g_hTooltip = nullptr; 
+
 static ULONG_PTR g_gdiplusToken;
 
-static HFONT g_hFontUI = nullptr, g_hFontList = nullptr, g_hFontListSub = nullptr;
+static HFONT g_hFontUI = nullptr, g_hFontList = nullptr, g_hFontListSub = nullptr, g_hFontType = nullptr;
 static HBRUSH g_hBrInputBg = nullptr, g_hBrBg = nullptr;
 
 static std::wstring g_baseDir;
@@ -166,14 +183,22 @@ static PropertyItem* g_pAddPropertyItem = nullptr;
 
 static std::wstring g_lastTempPath = L"";
 
+static int g_tooltipTargetIndex = -1; 
+static bool g_tooltipShown = false;   
+static std::wstring g_tooltipTextMain;
+static std::wstring g_tooltipTextSub;
+
 // ============================================================
 // 前方宣言
 // ============================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+void OpenAddDialog(const std::string& data, bool isEdit);
+int ShowDarkMsg(HWND parent, LPCWSTR text, LPCWSTR title, UINT type);
+void RefreshAssets(bool reloadFav);
 
 // ============================================================
-// 1. ユーティリティ & 設定ファイル処理 (Win32 API)
+// 1. ユーティリティ & 設定ファイル処理
 // ============================================================
 static std::wstring ToLower(const std::wstring& s) {
     std::wstring ret = s;
@@ -181,30 +206,6 @@ static std::wstring ToLower(const std::wstring& s) {
     return ret;
 }
 
-static std::wstring GetFavFilePath() { 
-    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
-    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetFavorites.txt"); 
-    return path; 
-}
-static std::wstring GetFixedFilePath() { 
-    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
-    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetFixed.txt"); 
-    return path; 
-}
-static std::wstring GetConfigPath() { 
-    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
-    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetConfig.ini"); 
-    return path; 
-}
-
-static void InitBaseDir() {
-    if (!g_baseDir.empty()) return;
-    wchar_t path[MAX_PATH] = {0}; GetModuleFileNameW(g_hInst, path, MAX_PATH);
-    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAsset");
-    g_baseDir = path; CreateDirectoryW(g_baseDir.c_str(), nullptr);
-}
-
-// Win32 API File I/O
 static std::string ReadFileContent(const std::wstring& path) {
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return "";
@@ -214,6 +215,16 @@ static std::string ReadFileContent(const std::wstring& path) {
     ReadFile(hFile, buffer.data(), fileSize, &bytesRead, NULL);
     CloseHandle(hFile);
     return std::string(buffer.begin(), buffer.begin() + bytesRead);
+}
+
+static std::string ReadFileHead(const std::wstring& path, int size) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+    std::vector<char> buffer(size + 1); DWORD bytesRead = 0;
+    ReadFile(hFile, buffer.data(), size, &bytesRead, NULL);
+    CloseHandle(hFile);
+    buffer[bytesRead] = '\0';
+    return std::string(buffer.data());
 }
 
 static void WriteFileContent(const std::wstring& path, const std::string& content) {
@@ -232,6 +243,88 @@ static void RemoveLinesStartingWith(std::string& str, const std::string& prefix)
         output += line + "\r\n";
     }
     str = output;
+}
+
+static void ReplaceStringAll(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t start_pos = 0;
+    while ((start_pos = s.find(from, start_pos)) != std::string::npos) {
+        s.replace(start_pos, from.length(), to);
+        start_pos += to.length();
+    }
+}
+
+// パターンA修復
+static std::string RepairLegacyObjectContent(const std::string& src) {
+    std::vector<size_t> headers;
+    size_t pos = 0;
+    while ((pos = src.find("[Object]", pos)) != std::string::npos) {
+        char next = (pos + 8 < src.length()) ? src[pos + 8] : 0;
+        if (next == '\r' || next == '\n') headers.push_back(pos);
+        pos += 8;
+    }
+    if (headers.empty()) return src;
+    
+    std::string result = "";
+    if (headers[0] > 0) result += src.substr(0, headers[0]);
+    
+    for (size_t i = 0; i < headers.size(); i++) {
+        size_t start = headers[i];
+        size_t end = (i + 1 < headers.size()) ? headers[i+1] : src.length();
+        std::string block = src.substr(start, end - start);
+        
+        block.replace(0, 8, "[" + std::to_string(i) + "]");
+        
+        size_t eol = block.find_first_of("\r\n");
+        if (eol != std::string::npos) {
+            size_t nextLine = eol;
+            while(nextLine < block.length() && (block[nextLine] == '\r' || block[nextLine] == '\n')) nextLine++;
+            block.insert(nextLine, "layer=" + std::to_string(i + 1) + "\r\n");
+        }
+        
+        std::string oldSub = "[Object.";
+        std::string newSub = "[" + std::to_string(i) + ".";
+        ReplaceStringAll(block, oldSub, newSub);
+        
+        result += block;
+    }
+    return result;
+}
+
+// パターンB最適化
+static std::string NormalizeSingleObjectContent(const std::string& src) {
+    std::string s = src;
+    ReplaceStringAll(s, "[0]", "[Object]");
+    ReplaceStringAll(s, "[0.", "[Object.");
+    RemoveLinesStartingWith(s, "layer=");
+    return s;
+}
+
+static int GetObjectLayerIndex(void* obj) {
+    if (!obj) return 0;
+    return *(int*)((char*)obj + 0x60); 
+}
+
+static std::wstring GetFavFilePath() { 
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetFavorites.txt"); 
+    return path; 
+}
+static std::wstring GetFixedFilePath() { 
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetFixed.txt"); 
+    return path; 
+}
+static std::wstring GetConfigPath() { 
+    wchar_t path[MAX_PATH]; GetModuleFileNameW(g_hInst, path, MAX_PATH); 
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAssetConfig.ini"); 
+    return path; 
+}
+static void InitBaseDir() {
+    if (!g_baseDir.empty()) return;
+    wchar_t path[MAX_PATH] = {0}; GetModuleFileNameW(g_hInst, path, MAX_PATH);
+    PathRemoveFileSpecW(path); PathAppendW(path, L"MyAsset");
+    g_baseDir = path; CreateDirectoryW(g_baseDir.c_str(), nullptr);
 }
 
 void SaveFavorites() { 
@@ -370,8 +463,134 @@ static bool GenerateThumbnail(const std::wstring& srcPath, const std::wstring& d
     return false;
 }
 
+// 起動時一括チェック＆最適化関数
+static void CheckAndOptimizeLegacyAssets(HWND hwnd) {
+    std::wstring cfg = GetConfigPath();
+    int done = GetPrivateProfileIntW(L"Settings", L"LegacyCheckDone", 0, cfg.c_str());
+    if (done == 1) return; // 既にチェック済みなら即リターン
+
+    InitBaseDir();
+    
+    // スキャン開始 (カウント)
+    int needRepair = 0;   // Pattern A: [Object]重複シングルObject
+    int needOptimize = 0; // Pattern B: 旧マルチObject
+    
+    // 再帰探索で全ファイルをチェック
+    std::function<void(std::wstring)> scanDir = [&](std::wstring d) {
+        std::wstring sp = d + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(sp.c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    scanDir(d + L"\\" + fd.cFileName);
+                } else {
+                    std::wstring name = fd.cFileName;
+                    if (name.size() > 7 && name.substr(name.size()-7) == L".object") {
+                        std::wstring path = d + L"\\" + name;
+                        std::string content = ReadFileContent(path);
+                        
+                        int hCount = 0;
+                        size_t pos = 0;
+                        while ((pos = content.find("[Object]", pos)) != std::string::npos) {
+                            char next = (pos + 8 < content.length()) ? content[pos + 8] : 0;
+                            if (next == '\r' || next == '\n') hCount++;
+                            pos += 8;
+                        }
+                        bool hasIdx = (content.find("[0]") != std::string::npos);
+
+                        if (hCount >= 2 && !hasIdx) needRepair++;
+                        else if (hasIdx && content.find("[1]") == std::string::npos) needOptimize++;
+                    }
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    };
+    scanDir(g_baseDir);
+
+    // 修正が必要なファイルがなければ、何もせずフラグを立てて終了
+    if (needRepair == 0 && needOptimize == 0) {
+        WritePrivateProfileStringW(L"Settings", L"LegacyCheckDone", L"1", cfg.c_str());
+        return;
+    }
+
+    // ユーザーに確認
+    std::wstring msg = L"【My Asset Manager】\nアセット形式の確認\n\n";
+    msg += L"形式の最適化が必要なファイルが " + std::to_wstring(needRepair + needOptimize) + L" 個見つかりました。\n";
+    if (needRepair > 0) msg += L"・複数オブジェクト(旧仕様)の修復: " + std::to_wstring(needRepair) + L" 個\n";
+    if (needOptimize > 0) msg += L"・単体オブジェクトの最適化: " + std::to_wstring(needOptimize) + L" 個\n";
+    msg += L"\n自動的に修正・最適化しますか？";
+
+    int res = ShowDarkMsg(hwnd, msg.c_str(), L"確認", MB_YESNO);
+
+    if (res != IDYES) {
+        // いいえなら次回以降スキップ
+        WritePrivateProfileStringW(L"Settings", L"LegacyCheckDone", L"1", cfg.c_str());
+        return;
+    }
+
+    // 書き換え実行
+    int fixCount = 0;
+    std::function<void(std::wstring)> fixDir = [&](std::wstring d) {
+        std::wstring sp = d + L"\\*";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(sp.c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    fixDir(d + L"\\" + fd.cFileName);
+                } else {
+                    std::wstring name = fd.cFileName;
+                    if (name.size() > 7 && name.substr(name.size()-7) == L".object") {
+                        std::wstring path = d + L"\\" + name;
+                        std::string content = ReadFileContent(path);
+                        bool modified = false;
+
+                        // Pattern A check
+                        int hCount = 0;
+                        size_t pos = 0;
+                        while ((pos = content.find("[Object]", pos)) != std::string::npos) {
+                            char next = (pos + 8 < content.length()) ? content[pos + 8] : 0;
+                            if (next == '\r' || next == '\n') hCount++;
+                            pos += 8;
+                        }
+                        bool hasIdx = (content.find("[0]") != std::string::npos);
+
+                        if (hCount >= 2 && !hasIdx) {
+                            content = RepairLegacyObjectContent(content);
+                            modified = true;
+                        }
+                        // Pattern B check
+                        else if (hasIdx && content.find("[1]") == std::string::npos) {
+                            content = NormalizeSingleObjectContent(content);
+                            modified = true;
+                        }
+
+                        if (modified) {
+                            WriteFileContent(path, content);
+                            fixCount++;
+                        }
+                    }
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    };
+    fixDir(g_baseDir);
+
+    WritePrivateProfileStringW(L"Settings", L"LegacyCheckDone", L"1", cfg.c_str());
+    
+    std::wstring doneMsg = std::to_wstring(fixCount) + L" 個のファイルを最適化しました。";
+    ShowDarkMsg(hwnd, doneMsg.c_str(), L"完了", MB_OK);
+    
+    RefreshAssets(false);
+}
+
 // ============================================================
-// 2. ドラッグ＆ドロップ実装 (COM) - 前方定義
+// 2. ドラッグ＆ドロップ実装 (COM)
 // ============================================================
 class CEnumFormatEtc : public IEnumFORMATETC {
     long m_cRef; int m_nIndex;
@@ -499,6 +718,7 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE|WS_CHILD|BS_OWNERDRAW, 110, 140, 80, 30, hwnd, (HMENU)ID_BTN_MSG_OK, g_hInst, NULL);
         return 0;
     }
+    
     case WM_PAINT: { PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, g_hBrBg); DrawTitleBar(hdc, rc.right, L"設定"); DrawWindowBorder(hwnd); EndPaint(hwnd, &ps); return 0; }
     case WM_NCHITTEST: { 
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &pt); 
@@ -546,7 +766,6 @@ void ScanDirectory(const std::wstring& dir, const std::wstring& category) {
         do {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
             
-            
             if (wcsncmp(fd.cFileName, L"_auto_", 6) == 0) continue;
 
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { ScanDirectory(dir + L"\\" + fd.cFileName, fd.cFileName); }
@@ -557,6 +776,9 @@ void ScanDirectory(const std::wstring& dir, const std::wstring& category) {
                     a.isFavorite = (g_favPaths.count(a.path) > 0);
                     a.isFixedFrame = (g_fixedPaths.count(a.path) > 0);
                     
+                    std::string head = ReadFileHead(a.path, 100);
+                    a.isMulti = (head.find("[0]") != std::string::npos);
+
                     a.pImage = nullptr; a.frameCount = 0; a.frameDelays = nullptr; a.currentFrame = 0; a.pPropertyItem = nullptr;
                     std::wstring p1 = dir + L"\\" + a.name + L".png", p2 = dir + L"\\" + a.name + L".gif", lp = L"";
                     if (PathFileExistsW(p2.c_str())) lp = p2; else if (PathFileExistsW(p1.c_str())) lp = p1;
@@ -593,13 +815,7 @@ void RefreshAssets(bool reloadFav) {
     InitBaseDir(); if (reloadFav) LoadFavorites(); 
     LoadFixedFrames(); 
     LoadConfig(); 
-    
-    
-    if (!g_lastTempPath.empty()) {
-        DeleteFileW(g_lastTempPath.c_str());
-        g_lastTempPath = L"";
-    }
-
+    if (!g_lastTempPath.empty()) { DeleteFileW(g_lastTempPath.c_str()); g_lastTempPath = L""; }
     ClearAssets(); ScanDirectory(g_baseDir, L"Main"); 
     g_categories.clear(); std::set<std::wstring> cs; for(auto& a : g_assets) cs.insert(a.category);
     if(g_hCombo) { SendMessage(g_hCombo, CB_RESETCONTENT, 0, 0); SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)L"すべて (ALL)"); g_categories.push_back(L"ALL"); for(auto& c : cs) { SendMessage(g_hCombo, CB_ADDSTRING, 0, (LPARAM)c.c_str()); g_categories.push_back(c); } SendMessage(g_hCombo, CB_SETCURSEL, 0, 0); }
@@ -607,8 +823,47 @@ void RefreshAssets(bool reloadFav) {
 }
 
 // ============================================================
-// 6. スニッピング & 登録ダイアログ
+// 6. スニッピング & 登録ダイアログ & ツールチップ
 // ============================================================
+
+static LRESULT CALLBACK TooltipWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_NCHITTEST: return HTTRANSPARENT; 
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH brBg = CreateSolidBrush(COL_TIP_BG); FillRect(hdc, &rc, brBg); DeleteObject(brBg);
+        HBRUSH brBorder = CreateSolidBrush(COL_TIP_BORDER); FrameRect(hdc, &rc, brBorder); DeleteObject(brBorder);
+        SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, COL_TIP_TEXT); SelectObject(hdc, g_hFontUI);
+        RECT rcMain = {5, 5, rc.right - 5, 20};
+        DrawTextW(hdc, g_tooltipTextMain.c_str(), -1, &rcMain, DT_LEFT | DT_TOP | DT_SINGLELINE);
+        RECT rcSub = {5, 25, rc.right - 5, rc.bottom - 5};
+        SetTextColor(hdc, RGB(180, 180, 180));
+        DrawTextW(hdc, g_tooltipTextSub.c_str(), -1, &rcSub, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        EndPaint(hwnd, &ps); return 0;
+    }
+    } return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+static void ShowMyTooltip(int x, int y, const std::wstring& mainText, const std::wstring& subText) {
+    if (g_tooltipShown) return;
+    if (!g_hTooltip) {
+        WNDCLASSW wc = {0}; wc.lpfnWndProc = TooltipWndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Tooltip";
+        wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+        RegisterClassW(&wc);
+        g_hTooltip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"MyAsset_Tooltip", NULL, WS_POPUP, 0, 0, 0, 0, NULL, NULL, g_hInst, NULL);
+    }
+    g_tooltipTextMain = mainText; g_tooltipTextSub = subText;
+    int w = 220; int h = 60; 
+    SetWindowPos(g_hTooltip, HWND_TOPMOST, x + 15, y + 15, w, h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    InvalidateRect(g_hTooltip, NULL, FALSE);
+    g_tooltipShown = true;
+}
+
+static void HideMyTooltip() {
+    if (g_hTooltip && g_tooltipShown) { ShowWindow(g_hTooltip, SW_HIDE); g_tooltipShown = false; }
+}
+
 static Bitmap* LoadBitmapNoLock(const std::wstring& path, IStream** ppStream) {
     *ppStream = nullptr;
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -649,14 +904,7 @@ void UpdateAddPreviewImage() {
 
 static LRESULT CALLBACK SnipWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_KEYDOWN: 
-        if (wp == VK_ESCAPE) { 
-            ReleaseCapture();
-            DestroyWindow(hwnd); 
-            if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); } 
-            else if (g_hwnd) { ShowWindow(g_hwnd, SW_SHOW); } 
-        } 
-        return 0;
+    case WM_KEYDOWN: if (wp == VK_ESCAPE) { ReleaseCapture(); DestroyWindow(hwnd); if (g_hDlg) { ShowWindow(g_hDlg, SW_SHOW); SetForegroundWindow(g_hDlg); } else if (g_hwnd) { ShowWindow(g_hwnd, SW_SHOW); } } return 0;
     case WM_LBUTTONDOWN: g_isSnipping = true; g_snipStart.x = GET_X_LPARAM(lp); g_snipStart.y = GET_Y_LPARAM(lp); g_snipEnd = g_snipStart; SetCapture(hwnd); return 0;
     case WM_MOUSEMOVE: if (g_isSnipping) { g_snipEnd.x = GET_X_LPARAM(lp); g_snipEnd.y = GET_Y_LPARAM(lp); InvalidateRect(hwnd, NULL, FALSE); } return 0;
     case WM_LBUTTONUP: if (g_isSnipping) {
@@ -703,22 +951,40 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, g_hBrBg); DrawTitleBar(hdc, rc.right, L"アセット編集"); DrawWindowBorder(hwnd);
         Graphics graphics(hdc); RECT rp = {75, TITLE_H+120, 335, TITLE_H+266}; HBRUSH brP = CreateSolidBrush(RGB(20, 20, 20)); FillRect(hdc, &rp, brP); DeleteObject(brP);
+        
         if (g_pAddPreviewImage) {
-            if (g_addFrameCount > 1) { GUID gt = FrameDimensionTime; g_pAddPreviewImage->SelectActiveFrame(&gt, g_addCurrentFrame); } graphics.DrawImage(g_pAddPreviewImage, (INT)rp.left, (INT)rp.top, 260, 146);
+            if (g_addFrameCount > 1) { GUID gt = FrameDimensionTime; g_pAddPreviewImage->SelectActiveFrame(&gt, g_addCurrentFrame); } 
+            
+            
+            UINT iw = g_pAddPreviewImage->GetWidth();
+            UINT ih = g_pAddPreviewImage->GetHeight();
+            float previewW = 260.0f;
+            float previewH = 146.0f;
+            
+            float thumbRatio = previewW / previewH;
+            float imgRatio = (float)iw / (float)ih;
+            float srcX = 0, srcY = 0, srcW = (float)iw, srcH = (float)ih;
+
+            if (imgRatio > thumbRatio) {
+                srcW = ih * thumbRatio;
+                srcX = (iw - srcW) / 2.0f;
+            } else {
+                srcH = iw / thumbRatio;
+                srcY = (ih - srcH) / 2.0f;
+            }
+
+            graphics.DrawImage(g_pAddPreviewImage, 
+                Rect((INT)rp.left, (INT)rp.top, (INT)previewW, (INT)previewH),
+                (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
+                UnitPixel);
+            
+
             RECT rx = { rp.right - 24, rp.top, rp.right, rp.top + 24 }; HBRUSH brX = CreateSolidBrush(RGB(200, 50, 50)); FillRect(hdc, &rx, brX); DeleteObject(brX);
             SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(255, 255, 255)); DrawTextW(hdc, L"×", -1, &rx, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else { SetTextColor(hdc, COL_TEXT); DrawTextW(hdc, L"No Preview (Click to Add)", -1, &rp, DT_CENTER | DT_VCENTER | DT_SINGLELINE); }
         EndPaint(hwnd, &ps); return 0;
     }
-    case WM_NCHITTEST: { 
-        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &pt); 
-        RECT rc; GetClientRect(hwnd, &rc);
-        if (pt.y < TITLE_H) { 
-            if (pt.x > rc.right - 40) return HTCLIENT; 
-            return HTCAPTION; 
-        } 
-        return HTCLIENT; 
-    }
+    case WM_NCHITTEST: { POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &pt); RECT rc; GetClientRect(hwnd, &rc); if (pt.y < TITLE_H) { if (pt.x > rc.right - 40) return HTCLIENT; return HTCAPTION; } return HTCLIENT; }
     case WM_LBUTTONUP: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; RECT rc; GetClientRect(hwnd, &rc); 
         if (pt.y < TITLE_H && pt.x > rc.right - 40) { DestroyWindow(hwnd); return 0; }
@@ -730,48 +996,63 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DRAWITEM: DrawDarkButton((LPDRAWITEMSTRUCT)lp); return TRUE;
     case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: { HDC hdc = (HDC)wp; SetTextColor(hdc, COL_TEXT); SetBkColor(hdc, COL_INPUT_BG); return (LRESULT)g_hBrInputBg; }
     case WM_CTLCOLORSTATIC: { HDC hdc = (HDC)wp; SetTextColor(hdc, COL_TEXT); SetBkMode(hdc, TRANSPARENT); return (LRESULT)g_hBrBg; }
+    
     case WM_COMMAND: {
         if (LOWORD(wp) == ID_BTN_SAVE) {
-            wchar_t nb[256], cb[256]; GetDlgItemTextW(hwnd, IDC_EDIT_NAME, nb, 256); GetDlgItemTextW(hwnd, IDC_COMBO_CAT, cb, 256);
+            wchar_t nb[256], cb[256]; 
+            GetDlgItemTextW(hwnd, IDC_EDIT_NAME, nb, 256); 
+            GetDlgItemTextW(hwnd, IDC_COMBO_CAT, cb, 256);
+            
             if (wcslen(nb) == 0) { ShowDarkMsg(hwnd, L"名前を入力してください", L"確認", MB_OK); return 0; }
-            InitBaseDir(); std::wstring sd = g_baseDir + L"\\" + cb; CreateDirectoryW(sd.c_str(), nullptr);
+            
+            InitBaseDir(); 
+            std::wstring sd = g_baseDir + L"\\" + cb; 
+            CreateDirectoryW(sd.c_str(), nullptr);
+            
             std::wstring fn = g_editOrgPath.empty() ? GetUniqueFileName(sd, nb) : nb;
-            std::wstring sp = sd + L"\\" + fn + L".object";
-            if (g_isImageRemoved && !g_editOrgPath.empty()) { std::wstring b = g_editOrgPath.substr(0, g_editOrgPath.find_last_of(L".")); DeleteFileW((b+L".png").c_str()); DeleteFileW((b+L".gif").c_str()); }
-            
-            if (g_pAddPreviewImage) { delete g_pAddPreviewImage; g_pAddPreviewImage = nullptr; }
-            if (g_pAddPreviewStream) { g_pAddPreviewStream->Release(); g_pAddPreviewStream = nullptr; }
-            if (g_pAddPropertyItem) { free(g_pAddPropertyItem); g_pAddPropertyItem = nullptr; }
-            
-            if (!g_tempImgPath.empty() && PathFileExistsW(g_tempImgPath.c_str())) {
-                std::wstring ext = IsGifFile(g_tempImgPath) ? L".gif" : L".png";
-                std::wstring ip = sd + L"\\" + fn + ext;
-                DeleteFileW((sd + L"\\" + fn + L".png").c_str()); DeleteFileW((sd + L"\\" + fn + L".gif").c_str());
-                if (g_tempImgPath.find(L"myasset_temp") != std::wstring::npos) 
-                    MoveFileExW(g_tempImgPath.c_str(), ip.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
-                else 
-                    CopyFileW(g_tempImgPath.c_str(), ip.c_str(), FALSE);
-            }
-            
+            std::wstring destBase = sd + L"\\" + fn;
+            std::wstring sp = destBase + L".object";
             
             std::wstring oldBase = L"";
             if (!g_editOrgPath.empty()) oldBase = g_editOrgPath.substr(0, g_editOrgPath.find_last_of(L"."));
 
-            if (!g_editOrgPath.empty()) MoveFileW(g_editOrgPath.c_str(), sp.c_str());
-            else { WriteFileContent(sp, g_tempAliasData); }
+            if (!g_editOrgPath.empty()) {
+                MoveFileW(g_editOrgPath.c_str(), sp.c_str());
+            } else {
+                WriteFileContent(sp, g_tempAliasData); 
+            }
             
-            // 画像の移動
+            // プレビューの解放
+            if (g_pAddPreviewImage) { delete g_pAddPreviewImage; g_pAddPreviewImage = nullptr; }
+            if (g_pAddPreviewStream) { g_pAddPreviewStream->Release(); g_pAddPreviewStream = nullptr; }
+
+            // 旧画像の整理
             if (!oldBase.empty()) {
-                std::wstring newBase = sd + L"\\" + fn;
-                if (oldBase != newBase) {
-                    if (!g_isImageRemoved && g_tempImgPath.empty()) {
-                        MoveFileW((oldBase + L".png").c_str(), (newBase + L".png").c_str());
-                        MoveFileW((oldBase + L".gif").c_str(), (newBase + L".gif").c_str());
-                    } else if (!g_tempImgPath.empty()) {
+                bool nameChanged = (oldBase != destBase);
+                bool imageUpdated = (!g_tempImgPath.empty());
+                
+                if (nameChanged) {
+                    if (!g_isImageRemoved && !imageUpdated) {
+                        MoveFileW((oldBase + L".png").c_str(), (destBase + L".png").c_str());
+                        MoveFileW((oldBase + L".gif").c_str(), (destBase + L".gif").c_str());
+                    } else {
+                        DeleteFileW((oldBase + L".png").c_str());
+                        DeleteFileW((oldBase + L".gif").c_str());
+                    }
+                } else {
+                    if (g_isImageRemoved || imageUpdated) {
                         DeleteFileW((oldBase + L".png").c_str());
                         DeleteFileW((oldBase + L".gif").c_str());
                     }
                 }
+            }
+
+            // 新しいキャプチャ画像の移動
+            if (!g_tempImgPath.empty() && PathFileExistsW(g_tempImgPath.c_str())) {
+                std::wstring ext = g_tempImgPath.substr(g_tempImgPath.find_last_of(L"."));
+                std::wstring destImgPath = destBase + ext;
+                DeleteFileW(destImgPath.c_str());
+                MoveFileW(g_tempImgPath.c_str(), destImgPath.c_str());
             }
 
             RefreshAssets(false); 
@@ -781,6 +1062,7 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (LOWORD(wp) == ID_BTN_SNIP) StartSnipping();
         return 0;
     }
+
     case WM_DESTROY: 
         SaveWindowPos(hwnd, true); 
         if (g_pAddPreviewImage) { delete g_pAddPreviewImage; g_pAddPreviewImage = nullptr; }
@@ -792,12 +1074,8 @@ static LRESULT CALLBACK AddDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void OpenAddDialog(const std::string& data, bool isEdit) { 
     if (g_hDlg) { SetForegroundWindow(g_hDlg); return; } 
     g_tempAliasData = data; if (!isEdit) g_editOrgPath = L""; g_isImageRemoved = false; g_tempImgPath = L""; 
-    
-    LoadWindowConfig();
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX;
-    int y = (g_dlgY == -1) ? (sh - 400) / 2 : g_dlgY;
-    
+    LoadWindowConfig(); int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    int x = (g_dlgX == -1) ? (sw - 360) / 2 : g_dlgX; int y = (g_dlgY == -1) ? (sh - 400) / 2 : g_dlgY;
     WNDCLASSW wc = {0}; wc.lpfnWndProc = AddDlgProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAsset_Add"; wc.hbrBackground = g_hBrBg; RegisterClassW(&wc); 
     g_hDlg = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW, L"MyAsset_Add", L"アセット", WS_POPUP|WS_VISIBLE|WS_THICKFRAME, x, y, 360, 400, g_hwnd, nullptr, g_hInst, nullptr); 
 }
@@ -805,47 +1083,75 @@ void OpenAddDialog(const std::string& data, bool isEdit) {
 // ============================================================
 // 8. メイン描画 & プロシージャ (WndProc)
 // ============================================================
+
 static void DrawContent(HDC hdc, int w, int h) {
     RECT rcA = {0,0,w,h}; FillRect(hdc, &rcA, g_hBrBg); 
-    
-    // ★リスト描画
     int yO = TITLE_H - g_scrollY; HRGN hr = CreateRectRgn(0, TITLE_H, w, h - FOOTER_H); SelectClipRgn(hdc, hr);
     Graphics g(hdc); int cols = (std::max)(1, w / MIN_ITEM_WIDTH); int cw = w / cols;
+    
+    SetBkMode(hdc, TRANSPARENT);
+
     for (int i = 0; i < (int)g_displayAssets.size(); i++) {
         int x = (i % cols) * cw, y = (i / cols) * ITEM_HEIGHT + yO;
         if (y > h - FOOTER_H || y + ITEM_HEIGHT < TITLE_H) continue;
         RECT ri = {x + 2, y + 2, x + cw - 2, y + ITEM_HEIGHT - 2}; if (!RectVisible(hdc, &ri)) continue;
+        
         HBRUSH br = CreateSolidBrush((i == g_selectedIndex) ? COL_ITEM_SEL : COL_ITEM_BG); FillRect(hdc, &ri, br); DeleteObject(br);
         Asset* p = g_displayAssets[i];
-        if (p->pImage) { if (p->frameCount > 1) { GUID gt = FrameDimensionTime; p->pImage->SelectActiveFrame(&gt, p->currentFrame); } g.DrawImage(p->pImage, x + 7, y + 11, THUMB_W, THUMB_H); }
-        if (p->isFavorite) { SetTextColor(hdc, RGB(255, 215, 0)); SelectObject(hdc, g_hFontUI); RECT rs = {ri.right - 25, ri.top + 5, ri.right - 5, ri.top + 25}; SetBkMode(hdc, TRANSPARENT); DrawTextW(hdc, L"★", -1, &rs, DT_RIGHT); }
         
-        // ★固定フレームマーク描画
-        if (p->isFixedFrame) {
-            g.SetSmoothingMode(SmoothingModeAntiAlias);
-            SolidBrush brushCyan(Color(255, 31, 205, 219));
-            g.FillEllipse(&brushCyan, (INT)ri.right - 18, (INT)ri.bottom - 18, 10, 10);
-            g.SetSmoothingMode(SmoothingModeDefault);
+        if (p->pImage) { 
+            if (p->frameCount > 1) { 
+                GUID gt = FrameDimensionTime; 
+                p->pImage->SelectActiveFrame(&gt, p->currentFrame); 
+            } 
+            
+            // 画像サイズと描画先(サムネ枠)サイズを取得
+            UINT iw = p->pImage->GetWidth();
+            UINT ih = p->pImage->GetHeight();
+            float thumbRatio = (float)THUMB_W / (float)THUMB_H;
+            float imgRatio = (float)iw / (float)ih;
+
+            float srcX = 0, srcY = 0, srcW = (float)iw, srcH = (float)ih;
+
+            if (imgRatio > thumbRatio) {
+                srcW = ih * thumbRatio;
+                srcX = (iw - srcW) / 2.0f;
+            } else {
+                srcH = iw / thumbRatio;
+                srcY = (ih - srcH) / 2.0f;
+            }
+
+            g.DrawImage(p->pImage, 
+                Rect(x + 7, y + 11, THUMB_W, THUMB_H),
+                (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
+                UnitPixel);
         }
 
-        SetBkMode(hdc, TRANSPARENT); 
+        if (p->isFavorite) { SetTextColor(hdc, RGB(255, 215, 0)); SelectObject(hdc, g_hFontUI); RECT rs = {ri.right - 25, ri.top + 5, ri.right - 5, ri.top + 25}; DrawTextW(hdc, L"★", -1, &rs, DT_RIGHT); }
+        
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        if (p->isMulti) {
+            RECT rm = {ri.right - 25, ri.bottom - 25, ri.right - 5, ri.bottom - 5};
+            SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontType); 
+            DrawTextW(hdc, L"M", -1, &rm, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            RECT rs = {ri.right - 25, ri.bottom - 25, ri.right - 5, ri.bottom - 5};
+            SetTextColor(hdc, p->isFixedFrame ? COL_FIXED_TEXT : COL_TEXT); 
+            SelectObject(hdc, g_hFontType); 
+            DrawTextW(hdc, L"S", -1, &rs, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        g.SetSmoothingMode(SmoothingModeDefault);
+
         SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontList); RECT rn = {x + THUMB_W + 15, y + 15, ri.right - 30, y + 45}; DrawTextW(hdc, p->name.c_str(), -1, &rn, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         SetTextColor(hdc, COL_SUBTEXT); SelectObject(hdc, g_hFontListSub); RECT rc = {x + THUMB_W + 15, y + 50, ri.right - 10, ri.bottom - 5}; DrawTextW(hdc, p->category.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     SelectClipRgn(hdc, NULL); DeleteObject(hr); 
-
     DrawTitleBar(hdc, w, L"My Asset Manager");
-
     RECT rcF = {0, h - FOOTER_H, w, h}; HBRUSH brF = CreateSolidBrush(COL_FOOTER); FillRect(hdc, &rcF, brF); DeleteObject(brF);
-    
-    RECT rcRef = {w - 70, h - FOOTER_H + 8, w - 10, h - FOOTER_H + 32};
-    HBRUSH brRef = CreateSolidBrush(COL_BTN_BG); FillRect(hdc, &rcRef, brRef); DeleteObject(brRef);
+    RECT rcRef = {w - 70, h - FOOTER_H + 8, w - 10, h - FOOTER_H + 32}; HBRUSH brRef = CreateSolidBrush(COL_BTN_BG); FillRect(hdc, &rcRef, brRef); DeleteObject(brRef);
     SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, COL_TEXT); SelectObject(hdc, g_hFontUI); DrawTextW(hdc, L"更新", -1, &rcRef, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-
-    RECT rcFav = {w - 140, h - FOOTER_H + 8, w - 80, h - FOOTER_H + 32};
-    HBRUSH brFav = CreateSolidBrush(g_sortFavFirst ? COL_BTN_ACT : COL_BTN_BG); FillRect(hdc, &rcFav, brFav); DeleteObject(brFav);
+    RECT rcFav = {w - 140, h - FOOTER_H + 8, w - 80, h - FOOTER_H + 32}; HBRUSH brFav = CreateSolidBrush(g_sortFavFirst ? COL_BTN_ACT : COL_BTN_BG); FillRect(hdc, &rcFav, brFav); DeleteObject(brFav);
     DrawTextW(hdc, L"★優先", -1, &rcFav, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-    
     DrawWindowBorder(g_hwnd);
 }
 
@@ -856,12 +1162,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hFontUI = CreateFontW(15,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Yu Gothic UI");
         g_hFontList = CreateFontW(17,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Yu Gothic UI");
         g_hFontListSub = CreateFontW(13,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Yu Gothic UI");
+        g_hFontType = CreateFontW(16,0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Arial");
+
         g_hBrInputBg = CreateSolidBrush(COL_INPUT_BG); g_hBrBg = CreateSolidBrush(COL_BG);
         RegisterCustomDialogs();
         g_hCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST, 10, 0, 140, 300, hwnd, (HMENU)ID_COMBO_CATEGORY, g_hInst, NULL); SendMessageW(g_hCombo, WM_SETFONT, (WPARAM)g_hFontUI, 0);
         g_hSearch = CreateWindowW(L"EDIT", L"", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 160, 0, 100, 24, hwnd, (HMENU)ID_EDIT_SEARCH, g_hInst, NULL); SendMessageW(g_hSearch, WM_SETFONT, (WPARAM)g_hFontUI, 0);
+        
+        CheckAndOptimizeLegacyAssets(hwnd);
+        
         RefreshAssets(true); return 0;
     }
+
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &pt);
+        RECT rc; GetClientRect(hwnd, &rc);
+
+        if (pt.y >= rc.bottom - RESIZE_MARGIN) {
+            if (pt.x <= RESIZE_MARGIN) return HTBOTTOMLEFT;
+            if (pt.x >= rc.right - RESIZE_MARGIN) return HTBOTTOMRIGHT;
+            return HTBOTTOM;
+        }
+        if (pt.y <= RESIZE_MARGIN) {
+            if (pt.x <= RESIZE_MARGIN) return HTTOPLEFT;
+            if (pt.x >= rc.right - RESIZE_MARGIN) return HTTOPRIGHT;
+            return HTTOP;
+        }
+        if (pt.x <= RESIZE_MARGIN) return HTLEFT;
+        if (pt.x >= rc.right - RESIZE_MARGIN) return HTRIGHT;
+
+        if (pt.y < TITLE_H) {
+            if (pt.x > rc.right - 40) return HTCLIENT; 
+            return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+
     case WM_NCCALCSIZE: if(wp) return 0; return DefWindowProc(hwnd, msg, wp, lp);
     case WM_NCACTIVATE: return DefWindowProc(hwnd, msg, wp, lp);
     case WM_MOUSEACTIVATE: return MA_ACTIVATE;
@@ -876,19 +1213,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SaveWindowPos(hwnd, false);
         return 0;
     
-    case WM_TIMER: if (wp == ID_TIMER_HOVER && g_hoverIndex != -1 && g_hoverIndex < (int)g_displayAssets.size()) {
+    case WM_TIMER: 
+        if (wp == ID_TIMER_HOVER && g_hoverIndex != -1 && g_hoverIndex < (int)g_displayAssets.size()) {
             Asset* p = g_displayAssets[g_hoverIndex]; if (p->frameCount > 1) {
                 p->currentFrame = (p->currentFrame + 1) % p->frameCount; InvalidateRect(hwnd, NULL, FALSE);
                 UINT d = p->frameDelays ? p->frameDelays[p->currentFrame] : 100;
                 UINT sc = (UINT)(d * 100.0f / (float)(std::max)(1, g_gifSpeedPercent));
                 SetTimer(hwnd, ID_TIMER_HOVER, (std::max)(10u, sc), NULL);
             }
-        } return 0;
+        }
+        if (wp == ID_TIMER_TOOLTIP) {
+            KillTimer(hwnd, ID_TIMER_TOOLTIP);
+            if (g_tooltipTargetIndex != -1 && g_tooltipTargetIndex < (int)g_displayAssets.size()) {
+                Asset* p = g_displayAssets[g_tooltipTargetIndex];
+                std::wstring mainT, subT;
+                
+                if (p->isMulti) {
+                    mainT = L"複数オブジェクト (Multi Object)";
+                    subT = L"構造を維持するため、保存時の長さで固定されます";
+                } else if (p->isFixedFrame) {
+                    mainT = L"単体オブジェクト (Single Object)";
+                    subT = L"保存時のフレーム数を維持して配置します";
+                } else {
+                    mainT = L"単体オブジェクト (Single Object)";
+                    subT = L"現在のレイヤー表示の拡大率によって配置の長さが自動で伸縮します";
+                }
+                
+                POINT pt; GetCursorPos(&pt);
+                ShowMyTooltip(pt.x, pt.y, mainT, subT);
+            }
+        }
+        return 0;
     
     case WM_KILLFOCUS:
         ReleaseCapture();
         g_isDragCheck = false;
         g_hoverIndex = -1;
+        HideMyTooltip(); 
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
 
@@ -915,9 +1276,14 @@ RBUTTON_HANDLER:
             HMENU hm = CreatePopupMenu();
             if (idx >= 0 && idx < (int)g_displayAssets.size()) { 
                 g_contextTargetIndex = idx; Asset* p = g_displayAssets[idx]; 
+                
+                // Multiの場合はフレーム固定の切り替えを無効化
+                UINT flags = p->isMulti ? MF_GRAYED : MF_STRING;
+                if (p->isFixedFrame) flags |= MF_CHECKED;
+                
                 AppendMenuW(hm, MF_STRING, IDM_EDIT, L"編集"); 
                 AppendMenuW(hm, MF_STRING, IDM_FAVORITE, p->isFavorite ? L"お気に入り解除" : L"お気に入り登録"); 
-                AppendMenuW(hm, MF_STRING | (p->isFixedFrame ? MF_CHECKED : MF_UNCHECKED), IDM_TOGGLE_FIXED, L"フレーム数を固定する");
+                AppendMenuW(hm, flags, IDM_TOGGLE_FIXED, L"フレーム数を固定する");
                 AppendMenuW(hm, MF_STRING, IDM_DELETE, L"削除"); 
             }
             else { AppendMenuW(hm, MF_STRING, IDM_SETTINGS, L"プレビュー設定..."); AppendMenuW(hm, MF_STRING, ID_BTN_REFRESH, L"更新"); }
@@ -931,8 +1297,11 @@ RBUTTON_HANDLER:
         else if (id == IDM_EDIT && g_contextTargetIndex != -1) { Asset* p = g_displayAssets[g_contextTargetIndex]; if (p->pImage) { delete p->pImage; p->pImage = nullptr; } g_editOrgPath = p->path; g_editName = p->name; g_editCat = p->category; OpenAddDialog("", true); }
         else if (id == IDM_FAVORITE && g_contextTargetIndex != -1) { ToggleFavorite(g_displayAssets[g_contextTargetIndex]->path); RefreshAssets(false); }
         else if (id == IDM_TOGGLE_FIXED && g_contextTargetIndex != -1) { 
-            ToggleFixedFrame(g_displayAssets[g_contextTargetIndex]->path); 
-            RefreshAssets(false); 
+            // Multiでない場合のみトグル可能
+            if (!g_displayAssets[g_contextTargetIndex]->isMulti) {
+                ToggleFixedFrame(g_displayAssets[g_contextTargetIndex]->path); 
+                RefreshAssets(false); 
+            }
         }
         else if (id == IDM_DELETE && g_contextTargetIndex != -1) { 
             Asset* p = g_displayAssets[g_contextTargetIndex]; 
@@ -967,7 +1336,9 @@ RBUTTON_HANDLER:
     }
     case WM_MOUSELEAVE: { 
         if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; InvalidateRect(hwnd, NULL, FALSE); } 
-        g_isMouseTracking = false; return 0; 
+        g_isMouseTracking = false; 
+        HideMyTooltip(); 
+        return 0; 
     }
     case WM_LBUTTONUP: { 
         ReleaseCapture(); 
@@ -978,42 +1349,81 @@ RBUTTON_HANDLER:
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp); RECT rc; GetClientRect(hwnd, &rc);
         if (!g_isMouseTracking) { TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 }; TrackMouseEvent(&tme); g_isMouseTracking = true; }
+        
+        bool onMark = false;
         if (y > TITLE_H && y < rc.bottom - FOOTER_H) {
             int cols = (std::max)(1, (int)rc.right / MIN_ITEM_WIDTH); int cw = (int)rc.right / cols;
-            int idx = ((y - TITLE_H + g_scrollY) / ITEM_HEIGHT) * cols + (x / cw);
-            if (idx >= 0 && idx < (int)g_displayAssets.size()) { if (g_hoverIndex != idx) { g_hoverIndex = idx; SetTimer(hwnd, ID_TIMER_HOVER, 100, NULL); } }
-            else { if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; } }
+            int row = (y - TITLE_H + g_scrollY) / ITEM_HEIGHT; int col = x / cw;
+            int idx = row * cols + col;
+            
+            if (idx >= 0 && idx < (int)g_displayAssets.size()) { 
+                if (g_hoverIndex != idx) { g_hoverIndex = idx; SetTimer(hwnd, ID_TIMER_HOVER, 100, NULL); } 
+
+                int itemX = col * cw; int itemY = row * ITEM_HEIGHT + (TITLE_H - g_scrollY);
+                int right = itemX + cw - 2; int bottom = itemY + ITEM_HEIGHT - 2;
+                RECT rcMark = { right - 30, bottom - 30, right, bottom };
+                POINT pt = {x, y};
+                
+                if (PtInRect(&rcMark, pt)) {
+                    onMark = true;
+                    if (g_tooltipTargetIndex != idx) {
+                        HideMyTooltip();
+                        g_tooltipTargetIndex = idx;
+                        SetTimer(hwnd, ID_TIMER_TOOLTIP, 1000, NULL);
+                    }
+                }
+            } else { if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; } }
         } else { if (g_hoverIndex != -1) { KillTimer(hwnd, ID_TIMER_HOVER); g_hoverIndex = -1; } }
         
-        // D&D時のファイル作成ロジック
+        if (!onMark) {
+            KillTimer(hwnd, ID_TIMER_TOOLTIP);
+            HideMyTooltip();
+            g_tooltipTargetIndex = -1;
+        }
+
         if (g_isDragCheck && g_selectedIndex != -1 && g_selectedIndex < (int)g_displayAssets.size()) { 
             if (abs(x - g_dragStartPt.x) > 5 || abs(y - g_dragStartPt.y) > 5) { 
-                
-                
-                if (!g_lastTempPath.empty()) {
-                    DeleteFileW(g_lastTempPath.c_str());
-                    g_lastTempPath = L"";
-                }
-
-                ReleaseCapture(); 
-                g_isDragCheck = false; 
+                if (!g_lastTempPath.empty()) { DeleteFileW(g_lastTempPath.c_str()); g_lastTempPath = L""; }
+                ReleaseCapture(); g_isDragCheck = false; 
 
                 Asset* p = g_displayAssets[g_selectedIndex];
+                std::string content = ReadFileContent(p->path);
+
+                int headerCount = 0;
+                size_t pos = 0;
+                while ((pos = content.find("[Object]", pos)) != std::string::npos) {
+                    char next = (pos + 8 < content.length()) ? content[pos + 8] : 0;
+                    if (next == '\r' || next == '\n') headerCount++;
+                    pos += 8;
+                }
+                bool hasIndex = (content.find("[0]") != std::string::npos);
+
+                if (headerCount >= 2 && !hasIndex) {
+                    int res = ShowDarkMsg(hwnd, 
+                        L"古い形式のアセットを検知しました\n\nこのアセット（複数オブジェクト）は、以前のバージョンで保存されたため\nAviUtlで正常に読み込めない可能性があります。\n現在の仕様に合わせてデータを修復しますか？\n\n※元のレイヤー構造は復元できないため、階段状に配置されます。",
+                        L"アセット修復の確認", MB_YESNO);
+                        
+                    if (res == IDYES) {
+                        content = RepairLegacyObjectContent(content);
+                        WriteFileContent(p->path, content);
+                        p->isMulti = true;
+                    }
+                }
+                else if (hasIndex && content.find("[1]") == std::string::npos) {
+                    content = NormalizeSingleObjectContent(content);
+                    WriteFileContent(p->path, content);
+                    p->isMulti = false;
+                }
+
                 std::wstring dragPath = p->path;
                 std::wstring tempPath;
+                bool isModernFormat = (content.find("[Object]") != std::string::npos); 
+                bool isMulti = (content.find("[0]") != std::string::npos);
 
-                // ファイル内容を読み込む
-                std::string content = ReadFileContent(p->path);
-                
-                // [Object] から始まる新しい形式のファイルのみ frame行を削除する
-                bool isModernFormat = (content.find("[Object]") == 0); 
-
-                if (!p->isFixedFrame && isModernFormat) {
+                if (!p->isFixedFrame && !isMulti && isModernFormat) {
                     RemoveLinesStartingWith(content, "frame=");
-                    
                     std::wstring dir = p->path.substr(0, p->path.find_last_of(L"\\") + 1);
                     tempPath = dir + L"_auto_" + p->name + L".object"; 
-                    
                     WriteFileContent(tempPath, content);
                     dragPath = tempPath;
                     g_lastTempPath = tempPath; 
@@ -1026,48 +1436,20 @@ RBUTTON_HANDLER:
                     DoDragDrop(po, ps, DROPEFFECT_COPY, &de); 
                     po->Release(); 
                 } 
-                
                 g_selectedIndex = -1;
                 InvalidateRect(hwnd, NULL, FALSE);
             } 
         }
         return 0;
     }
-    case WM_MOUSEWHEEL: { 
-        RECT rc; GetClientRect(hwnd, &rc);
-        int viewH = rc.bottom - TITLE_H - FOOTER_H;
-        int cols = std::max(1, (int)rc.right / MIN_ITEM_WIDTH);
-        int rows = ((int)g_displayAssets.size() + cols - 1) / cols;
-        int contentH = rows * ITEM_HEIGHT;
-        int maxScroll = std::max(0, contentH - viewH + 20); 
-
-        int d = GET_WHEEL_DELTA_WPARAM(wp); 
-        g_scrollY -= (d / WHEEL_DELTA) * SCROLL_SPD; 
-        
-        if (g_scrollY < 0) g_scrollY = 0; 
-        if (g_scrollY > maxScroll) g_scrollY = maxScroll;
-
-        InvalidateRect(hwnd, NULL, FALSE); 
-        return 0; 
-    }
-    case WM_NCHITTEST: { 
-        LRESULT h = DefWindowProc(hwnd, msg, wp, lp); 
-        if (h == HTCLIENT) { 
-            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) }; ScreenToClient(hwnd, &pt); RECT rc; GetClientRect(hwnd, &rc); 
-            if (pt.y < TITLE_H) { if (pt.x > rc.right - 40) return HTCLIENT; return HTCAPTION; }
-            if (pt.y >= rc.bottom - RESIZE_MARGIN) return HTBOTTOM;
-            if (pt.x >= rc.right - RESIZE_MARGIN) return HTRIGHT;
-        } return h; 
-    }
     case WM_DESTROY: 
         SaveWindowPos(hwnd, false); 
-        
         if (!g_lastTempPath.empty()) DeleteFileW(g_lastTempPath.c_str());
-
         if(g_hDlg) DestroyWindow(g_hDlg);
         if(g_hSettingDlg) DestroyWindow(g_hSettingDlg);
         if(g_hSnipWnd) DestroyWindow(g_hSnipWnd);
         if(g_hInfoWnd) DestroyWindow(g_hInfoWnd);
+        if(g_hTooltip) DestroyWindow(g_hTooltip); 
         GdiplusShutdown(g_gdiplusToken); 
         PostQuitMessage(0); 
         return 0;
@@ -1076,40 +1458,67 @@ RBUTTON_HANDLER:
     }
 }
 
-
+// ------------------------------------------------------------
+// 9. AviUtl エントリポイント
+// ------------------------------------------------------------
 void OnAddAsset(EDIT_SECTION_SAFE* edit) {
-    if (!edit || !edit->get_selected_object_num) return; int count = edit->get_selected_object_num(); if (count <= 0) { ShowDarkMsg(NULL, L"オブジェクトを選択してください", L"Info", MB_OK); return; }
-    std::string bodyData; for(int i = 0; i < count; i++) { void* obj = edit->get_selected_object(i); if (obj) { LPCSTR raw = edit->get_object_alias(obj); if (raw) { std::string s = raw; bodyData += s + "\r\n"; } } }
+    if (!edit || !edit->get_selected_object_num) return; 
+    int count = edit->get_selected_object_num(); 
+    if (count <= 0) { ShowDarkMsg(NULL, L"オブジェクトを選択してください", L"Info", MB_OK); return; }
+    
+    std::string bodyData;
+    int minLayer = 99999;
+
+    for(int i = 0; i < count; i++) {
+        void* obj = edit->get_selected_object(i);
+        if (obj) {
+            int layer = GetObjectLayerIndex(obj);
+            if (layer < minLayer) minLayer = layer;
+        }
+    }
+    
+    if (count == 1) {
+        void* obj = edit->get_selected_object(0);
+        if (obj) {
+            LPCSTR raw = edit->get_object_alias(obj);
+            if (raw) bodyData = raw;
+        }
+    } 
+    else {
+        for(int i = 0; i < count; i++) { 
+            void* obj = edit->get_selected_object(i); 
+            if (obj) { 
+                LPCSTR raw = edit->get_object_alias(obj); 
+                if (raw) { 
+                    std::string s = raw; 
+                    std::string headerNew = "[" + std::to_string(i) + "]";
+                    std::string sectionNew = "[" + std::to_string(i) + ".";
+                    int currentLayer = GetObjectLayerIndex(obj);
+                    int relativeLayer = (currentLayer - minLayer) + 1;
+                    ReplaceStringAll(s, "[Object.", sectionNew);
+                    ReplaceStringAll(s, "[Object]", headerNew);
+                    size_t pos = s.find(headerNew);
+                    if (pos != std::string::npos) {
+                        s.insert(pos + headerNew.length(), "\r\nlayer=" + std::to_string(relativeLayer));
+                    }
+                    bodyData += s + "\r\n"; 
+                } 
+            } 
+        }
+    }
     OpenAddDialog(bodyData, false);
 }
 
-void OnShowMainWindow(EDIT_SECTION_SAFE* edit) { 
-    if (g_hwnd) { 
-        ShowWindow(g_hwnd, SW_RESTORE); 
-        ShowWindow(g_hwnd, SW_SHOW); 
-        SetForegroundWindow(g_hwnd); 
-    } 
-}
+void OnShowMainWindow(EDIT_SECTION_SAFE* edit) { if (g_hwnd) { ShowWindow(g_hwnd, SW_RESTORE); ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); } }
 
-void CreatePluginWindow() { 
-    LoadWindowConfig();
-    WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAssetMgr_Modern"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; wc.style = CS_HREDRAW | CS_VREDRAW; RegisterClassW(&wc); 
-    g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME, g_winX, g_winY, g_winW, g_winH, nullptr, nullptr, g_hInst, nullptr); 
-}
+void CreatePluginWindow() { LoadWindowConfig(); WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = g_hInst; wc.lpszClassName = L"MyAssetMgr_Modern"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = g_hBrBg; wc.style = CS_HREDRAW | CS_VREDRAW; RegisterClassW(&wc); g_hwnd = CreateWindowExW(WS_EX_TOPMOST, L"MyAssetMgr_Modern", L"My Asset Manager", WS_POPUP | WS_CLIPCHILDREN | WS_THICKFRAME, g_winX, g_winY, g_winW, g_winH, nullptr, nullptr, g_hInst, nullptr); }
 
 extern "C" __declspec(dllexport) void RegisterPlugin(HOST_APP_TABLE* host) { 
     HMODULE hm; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)RegisterPlugin, &hm); g_hInst = (HINSTANCE)hm;
-    g_host = host; host->set_plugin_information(L"My Asset Manager v1.2"); 
+    g_host = host; host->set_plugin_information(L"My Asset Manager v1.3"); 
     RegisterCustomDialogs(); CreatePluginWindow(); 
     if (g_hwnd) host->register_window_client(L"My Asset Manager", g_hwnd); 
     if (host->register_edit_menu) host->register_edit_menu(L"表示 > My Asset Manager", OnShowMainWindow); 
-    if (host->register_layer_menu) {
-        host->register_layer_menu(L"MyAsset: 一覧を開く", OnShowMainWindow);
-        host->register_layer_menu(L"MyAsset: 追加", OnAddAsset);
-    }
-    if (host->register_object_menu) {
-        host->register_object_menu(L"MyAsset: 一覧を開く", OnShowMainWindow);
-        host->register_object_menu(L"MyAsset: 追加", OnAddAsset);
-    }
+    if (host->register_layer_menu) { host->register_layer_menu(L"MyAsset: 一覧を開く", OnShowMainWindow); host->register_layer_menu(L"MyAsset: 追加", OnAddAsset); }
+    if (host->register_object_menu) { host->register_object_menu(L"MyAsset: 一覧を開く", OnShowMainWindow); host->register_object_menu(L"MyAsset: 追加", OnAddAsset); }
 }
-
